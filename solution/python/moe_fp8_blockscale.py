@@ -659,19 +659,72 @@ def prepare_gemm2_inputs(
 
 def _make_cute_fp8_tensor(from_dlpack_fn, tensor_int8, cutlass_mod, leading_dim=1):
     """Create a CuTe tensor from an int8 view of an FP8 tensor."""
-    ct = from_dlpack_fn(tensor_int8).mark_layout_dynamic(leading_dim=leading_dim)
+    ct = from_dlpack_fn(tensor_int8, assumed_align=16).mark_layout_dynamic(leading_dim=leading_dim)
     ct.element_type = cutlass_mod.Float8E4M3FN
     return ct
 
 
 def _make_cute_tensor(from_dlpack_fn, tensor, leading_dim=1):
     """Create a CuTe tensor from a regular tensor."""
-    return from_dlpack_fn(tensor).mark_layout_dynamic(leading_dim=leading_dim)
+    return from_dlpack_fn(tensor, assumed_align=16).mark_layout_dynamic(leading_dim=leading_dim)
+
+
+# ==============================================================================
+# Fused SwiGLU + FP8 block-scale quantize (single Triton kernel)
+#
+# Replaces: gemm1_result[:, :I].float(), gemm1_result[:, I:].float(),
+#           F.silu(up) * gate, and _quantize_fp8_kernel  (4 launches → 1)
+# ==============================================================================
+@triton.jit
+def _swiglu_quantize_kernel(
+    gemm1_out_ptr,   # [valid_m, 2*I] bfloat16
+    a2_out_ptr,      # [Tsum, I] int8 (FP8 as int8)
+    sfa2_out_ptr,    # [Tsum, I_BLOCKS] float32
+    Tsum,            # actual token count (grid rows == Tsum, guard for safety)
+    I: tl.constexpr,
+    I_BLOCKS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    TWO_I: tl.constexpr,
+):
+    """Fused SwiGLU activation + per-block FP8 quantization.
+
+    Each program handles one (token-row, I-block) pair:
+      gate = gemm1_out[row, :I]   (first half of 2*I)
+      up   = gemm1_out[row, I:]   (second half)
+      intermediate = silu(up) * gate  = up * sigmoid(up) * gate
+      scale = amax(|intermediate|) / FP8_MAX
+      output = float8(intermediate / scale)
+    """
+    row = tl.program_id(0)
+    col = tl.program_id(1)
+
+    if row >= Tsum:
+        return
+
+    i_offs = col * BLOCK + tl.arange(0, BLOCK)
+
+    # Load gate and up from bfloat16 GEMM1 output, cast to float32
+    gate = tl.load(gemm1_out_ptr + row * TWO_I + i_offs).to(tl.float32)
+    up   = tl.load(gemm1_out_ptr + row * TWO_I + I + i_offs).to(tl.float32)
+
+    # SwiGLU: silu(up) * gate = up * sigmoid(up) * gate
+    intermediate = up * tl.sigmoid(up) * gate
+
+    # Per-block FP8 quantize
+    amax  = tl.max(tl.abs(intermediate))
+    scale = tl.maximum(amax / FP8_MAX, 1e-12)
+    tl.store(sfa2_out_ptr + row * I_BLOCKS + col, scale)
+
+    fp8_vals = (intermediate / scale).to(tl.float8e4nv)
+    tl.store(a2_out_ptr + row * I + i_offs, fp8_vals.to(tl.int8, bitcast=True))
 
 
 # Module-level cache for compiled GEMM kernels and hardware info
 _gemm_cache = {}
 _hw_info_cache = {}
+# CUDA graph registry: (valid_m, T, local_expert_offset) → graph + static bufs
+_cuda_graph_registry = {}
 
 
 def _get_compiled_gemm(cache_key, cute_mod, kernel, a, b, c, sfa, sfb, gidx,
@@ -685,6 +738,195 @@ def _get_compiled_gemm(cache_key, cute_mod, kernel, a, b, c, sfa, sfb, gidx,
     return _gemm_cache[cache_key]
 
 
+def _build_cuda_graph(
+    cache_key, valid_m, T, Tsum, pad_m, local_expert_offset,
+    hidden_states, hidden_states_scale,
+    gemm1_weights, gemm1_weights_scale,
+    gemm2_weights, gemm2_weights_scale,
+    sorted_token_ids, topk_idx, weights, token_expert_map,
+    device,
+):
+    """
+    Build and cache a CUDA graph for the full expert-compute pipeline.
+
+    All intermediate tensors are pre-allocated as static buffers.
+    CuTe tensor wrappers are created once and reused across replays.
+    On each replay the caller updates the static INPUT buffers in-place,
+    then calls graph.replay() — zero Python overhead in the hot path.
+    """
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    import cuda.bindings.driver as cuda
+    from .contiguous_grouped_gemm import BlockwiseContiguousGroupedGemmKernel
+
+    H_BLOCKS = H // BLOCK
+    I_BLOCKS = I // BLOCK
+
+    # ── Static INPUT buffers (caller copies new data here before replay) ──────
+    s_hidden     = hidden_states.clone()
+    s_hs_scale   = hidden_states_scale.float().contiguous().clone()
+    s_sorted_ids = torch.zeros(valid_m, dtype=torch.int64, device=device)
+    s_sorted_ids[:Tsum].copy_(sorted_token_ids)
+    s_token_map  = torch.zeros(valid_m, dtype=torch.int32, device=device)
+    s_token_map[:Tsum].copy_(token_expert_map)
+    s_topk_idx   = topk_idx.clone()
+    s_weights    = weights.clone()
+
+    # ── Static INTERMEDIATE buffers ───────────────────────────────────────────
+    a1_buf       = torch.empty(valid_m, H,     dtype=hidden_states.dtype, device=device)
+    sfa1_buf     = torch.empty(valid_m, H_BLOCKS, dtype=torch.float32, device=device)
+    gemm1_out    = torch.empty(valid_m, 2 * I, dtype=torch.bfloat16,  device=device)
+    a2_buf       = torch.empty(valid_m, I,     dtype=torch.float8_e4m3fn, device=device)
+    sfa2_buf     = torch.empty(valid_m, I_BLOCKS, dtype=torch.float32, device=device)
+    gemm2_out    = torch.empty(valid_m, H,     dtype=torch.bfloat16,  device=device)
+    output_buf   = torch.zeros(T, H,           dtype=torch.float32,   device=device)
+
+    # ── CuTe wrappers for WEIGHT tensors (stable: weights never change) ───────
+    b1_cute  = from_dlpack(gemm1_weights.view(torch.int8).permute(1, 2, 0),
+                           assumed_align=16).mark_layout_dynamic(leading_dim=1)
+    b1_cute.element_type = cutlass.Float8E4M3FN
+    sfb1_cute = from_dlpack(gemm1_weights_scale.permute(1, 2, 0),
+                            assumed_align=16).mark_layout_dynamic(leading_dim=1)
+
+    b2_cute  = from_dlpack(gemm2_weights.view(torch.int8).permute(1, 2, 0),
+                           assumed_align=16).mark_layout_dynamic(leading_dim=1)
+    b2_cute.element_type = cutlass.Float8E4M3FN
+    sfb2_cute = from_dlpack(gemm2_weights_scale.permute(1, 2, 0),
+                            assumed_align=16).mark_layout_dynamic(leading_dim=1)
+
+    # ── CuTe wrappers for ACTIVATION tensors (point to static buffers) ────────
+    a1_cute  = from_dlpack(a1_buf.view(torch.int8).unsqueeze(-1),
+                           assumed_align=16).mark_layout_dynamic(leading_dim=1)
+    a1_cute.element_type = cutlass.Float8E4M3FN
+    sfa1_cute = from_dlpack(sfa1_buf.unsqueeze(-1),
+                            assumed_align=16).mark_layout_dynamic(leading_dim=1)
+    c1_cute   = from_dlpack(gemm1_out.unsqueeze(-1),
+                            assumed_align=16).mark_layout_dynamic(leading_dim=1)
+    gidx_cute = from_dlpack(s_token_map, assumed_align=4).mark_layout_dynamic()
+
+    a2_cute  = from_dlpack(a2_buf.view(torch.int8).unsqueeze(-1),
+                           assumed_align=16).mark_layout_dynamic(leading_dim=1)
+    a2_cute.element_type = cutlass.Float8E4M3FN
+    sfa2_cute = from_dlpack(sfa2_buf.unsqueeze(-1),
+                            assumed_align=16).mark_layout_dynamic(leading_dim=1)
+    c2_cute   = from_dlpack(gemm2_out.unsqueeze(-1),
+                            assumed_align=16).mark_layout_dynamic(leading_dim=1)
+
+    # ── Compile CuTe GEMM kernels (cached by valid_m) ─────────────────────────
+    cluster_size = 1 * 2
+    if cluster_size not in _hw_info_cache:
+        _hw_info_cache[cluster_size] = (
+            cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size)
+        )
+    max_active_clusters = _hw_info_cache[cluster_size]
+
+    torch_stream = torch.cuda.current_stream()
+    cu_stream    = cuda.CUstream(torch_stream.cuda_stream)
+
+    compiled_gemm1 = _get_compiled_gemm(
+        ("gemm1", valid_m), cute,
+        BlockwiseContiguousGroupedGemmKernel(
+            acc_dtype=cutlass.Float32, use_2cta_instrs=False,
+            mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 2),
+        ),
+        a1_cute, b1_cute, c1_cute, sfa1_cute, sfb1_cute, gidx_cute,
+        max_active_clusters, cu_stream,
+    )
+    compiled_gemm2 = _get_compiled_gemm(
+        ("gemm2", valid_m), cute,
+        BlockwiseContiguousGroupedGemmKernel(
+            acc_dtype=cutlass.Float32, use_2cta_instrs=False,
+            mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 2),
+        ),
+        a2_cute, b2_cute, c2_cute, sfa2_cute, sfb2_cute, gidx_cute,
+        max_active_clusters, cu_stream,
+    )
+
+    n_col         = H // 1024          # = 7
+    scatter_grid  = (Tsum, (H + 1023) // 1024)
+
+    # ── Inner function: pure GPU operations, captured in CUDA graph ───────────
+    def _inner():
+        # 1. Gather FP8 activations (Triton)
+        _gather_and_scale_kernel[(Tsum, n_col)](
+            s_hidden.view(torch.int8),
+            s_hs_scale,
+            s_sorted_ids,
+            a1_buf.view(torch.int8),
+            sfa1_buf,
+            T,
+            H=H, H_BLOCKS=H_BLOCKS, H_BLOCKS_PADDED=64, COPY_BLOCK=1024,
+        )
+        if pad_m > 0:
+            a1_buf[Tsum:valid_m].zero_()
+            sfa1_buf[Tsum:valid_m].zero_()
+
+        # 2. GEMM1 (CuTe DSL)
+        gemm1_out.zero_()
+        compiled_gemm1(
+            a1_cute, b1_cute, c1_cute,
+            sfa1_cute, sfb1_cute, gidx_cute,
+            cu_stream,
+        )
+
+        # 3. Fused SwiGLU + FP8 quantize (Triton, 4 ops → 1)
+        _swiglu_quantize_kernel[(Tsum, I_BLOCKS)](
+            gemm1_out,
+            a2_buf.view(torch.int8),
+            sfa2_buf,
+            Tsum,
+            I=I, I_BLOCKS=I_BLOCKS, BLOCK=BLOCK, FP8_MAX=448.0, TWO_I=2 * I,
+        )
+        if pad_m > 0:
+            a2_buf[Tsum:valid_m].zero_()
+            sfa2_buf[Tsum:valid_m].zero_()
+
+        # 4. GEMM2 (CuTe DSL)
+        gemm2_out.zero_()
+        compiled_gemm2(
+            a2_cute, b2_cute, c2_cute,
+            sfa2_cute, sfb2_cute, gidx_cute,
+            cu_stream,
+        )
+
+        # 5. Weighted scatter-add (Triton)
+        output_buf.zero_()
+        _weighted_scatter_add_kernel[scatter_grid](
+            gemm2_out, s_sorted_ids, s_token_map,
+            s_topk_idx, s_weights, output_buf,
+            local_expert_offset,
+            H_dim=H, TOP_K=TOP_K, BLOCK_H=1024,
+        )
+
+    # ── Warmup: JIT-compile all Triton kernels before graph capture ───────────
+    for _ in range(3):
+        _inner()
+    torch.cuda.synchronize()
+
+    # ── Capture CUDA graph ────────────────────────────────────────────────────
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        _inner()
+    torch.cuda.synchronize()
+
+    # Store everything that must stay alive for the lifetime of the graph
+    _cuda_graph_registry[cache_key] = dict(
+        graph=g, _inner_fn=_inner,
+        s_hidden=s_hidden, s_hs_scale=s_hs_scale,
+        s_sorted_ids=s_sorted_ids, s_token_map=s_token_map,
+        s_topk_idx=s_topk_idx, s_weights=s_weights,
+        a1_buf=a1_buf, sfa1_buf=sfa1_buf, gemm1_out=gemm1_out,
+        a2_buf=a2_buf, sfa2_buf=sfa2_buf, gemm2_out=gemm2_out,
+        output_buf=output_buf,
+        a1_cute=a1_cute, sfa1_cute=sfa1_cute, c1_cute=c1_cute,
+        b1_cute=b1_cute, sfb1_cute=sfb1_cute,
+        a2_cute=a2_cute, sfa2_cute=sfa2_cute, c2_cute=c2_cute,
+        b2_cute=b2_cute, sfb2_cute=sfb2_cute, gidx_cute=gidx_cute,
+        Tsum=Tsum, pad_m=pad_m,
+    )
+
+
 def expert_compute_cutedsl(
     hidden_states: torch.Tensor,        # [T, H] FP8
     hidden_states_scale: torch.Tensor,  # [H/BLOCK, T]
@@ -694,34 +936,25 @@ def expert_compute_cutedsl(
     gemm2_weights_scale: torch.Tensor,  # [E_local, H/BLOCK, I/BLOCK]
     sorted_token_ids: torch.Tensor,     # [total_selected]
     expert_offsets: torch.Tensor,       # [E_local + 1]
-    topk_idx: torch.Tensor,            # [T, TOP_K]
-    weights: torch.Tensor,             # [T, TOP_K]
+    topk_idx: torch.Tensor,             # [T, TOP_K]
+    weights: torch.Tensor,              # [T, TOP_K]
     local_expert_offset: int,
     token_expert_map: torch.Tensor = None,  # [total_selected] int32
 ) -> torch.Tensor:
     """
-    CuTe DSL Expert Compute using Blockwise Contiguous Grouped GEMM.
+    CuTe DSL Expert Compute with CUDA graph acceleration.
 
-    This function uses the BlockwiseContiguousGroupedGemmKernel from
-    examples/python/CuTeDSL/blackwell/blockwise_gemm/contiguous_grouped_gemm.py
-    for high-performance FP8 grouped GEMM on SM100a.
-
-    Flow:
-      1. Prepare contiguous grouped inputs (gather + sort by expert)
-      2. GEMM1: [Tsum, H] @ [E, 2*I, H].T → [Tsum, 2*I]  (FP8 blockwise)
-      3. SwiGLU: silu(up) * gate → [Tsum, I]
-      4. Quantize intermediate to FP8
-      5. GEMM2: [Tsum, I] @ [E, H, I].T → [Tsum, H]  (FP8 blockwise)
-      6. Weighted scatter-add back to output
+    On first call for a given (valid_m, T, local_expert_offset):
+      - Compiles CuTe DSL GEMM kernels
+      - Captures the full pipeline in a CUDA graph:
+          gather(FP8) → GEMM1 → fused SwiGLU+quant → GEMM2 → scatter-add
+    On subsequent calls:
+      - Copies inputs into pre-allocated static buffers (async GPU copies)
+      - Replays the CUDA graph (zero Python overhead between kernels)
     """
     try:
-        import cutlass
-        import cutlass.cute as cute
-        from cutlass.cute.runtime import from_dlpack
-        import cutlass.torch as cutlass_torch
-        import cuda.bindings.driver as cuda
+        import cutlass  # noqa: F401 – trigger ImportError early if missing
     except ImportError:
-        print("CuTe DSL not available, falling back to PyTorch implementation")
         return expert_compute_pytorch(
             hidden_states, hidden_states_scale,
             gemm1_weights, gemm1_weights_scale,
@@ -731,131 +964,45 @@ def expert_compute_cutedsl(
             token_expert_map,
         )
 
-    from .contiguous_grouped_gemm import BlockwiseContiguousGroupedGemmKernel
-
-    T = hidden_states.shape[0]
+    T    = hidden_states.shape[0]
     Tsum = sorted_token_ids.shape[0]
     device = hidden_states.device
 
     if Tsum == 0:
         return torch.zeros((T, H), dtype=torch.float32, device=device)
 
-    # ---- Step 1: Prepare GEMM1 inputs ----
-    # token_expert_map == repeat_interleave(arange(E_LOCAL), expert_counts),
-    # so pass it directly as gidx_mapping to skip the recomputation.
-    a1, sfa1, b1, sfb1, gidx = prepare_gemm1_inputs(
-        hidden_states, hidden_states_scale,
-        gemm1_weights, gemm1_weights_scale,
-        sorted_token_ids, token_expert_map,
-    )
-
-    # Pad Tsum to multiple of 128 for alignment
-    pad_m = (BLOCK - Tsum % BLOCK) % BLOCK
-    a1_int8 = a1.view(torch.int8)
-    if pad_m > 0:
-        a1_int8 = F.pad(a1_int8, (0, 0, 0, pad_m))
-        sfa1 = F.pad(sfa1, (0, 0, 0, pad_m))
-        gidx = F.pad(gidx, (0, pad_m), value=0)
+    pad_m   = (BLOCK - Tsum % BLOCK) % BLOCK
     valid_m = Tsum + pad_m
 
-    # Allocate GEMM1 output: [valid_m, 2*I]
-    gemm1_out = torch.zeros(valid_m, 2 * I, dtype=torch.bfloat16, device=device)
+    cache_key = (valid_m, T, local_expert_offset)
+    if cache_key not in _cuda_graph_registry:
+        _build_cuda_graph(
+            cache_key, valid_m, T, Tsum, pad_m, local_expert_offset,
+            hidden_states, hidden_states_scale,
+            gemm1_weights, gemm1_weights_scale,
+            gemm2_weights, gemm2_weights_scale,
+            sorted_token_ids, topk_idx, weights, token_expert_map,
+            device,
+        )
 
-    # ---- Step 2: GEMM1 via CuTe DSL ----
-    # Convert to CuTe tensors (K-major layout: leading_dim=1)
-    a1_cute = _make_cute_fp8_tensor(from_dlpack, a1_int8.unsqueeze(-1), cutlass)
-    sfa1_cute = _make_cute_tensor(from_dlpack, sfa1.unsqueeze(-1))
-    b1_cute = _make_cute_fp8_tensor(from_dlpack, b1.view(torch.int8).permute(1, 2, 0), cutlass)
-    sfb1_cute = _make_cute_tensor(from_dlpack, sfb1.permute(1, 2, 0))
-    c1_cute = _make_cute_tensor(from_dlpack, gemm1_out.unsqueeze(-1))
-    gidx_cute = from_dlpack(gidx).mark_layout_dynamic()
+    reg = _cuda_graph_registry[cache_key]
 
-    # Get CUDA stream
-    torch_stream = torch.cuda.current_stream()
-    current_stream = cuda.CUstream(torch_stream.cuda_stream)
-
-    # Get max active clusters (cached to avoid ~40ms overhead per call)
-    cluster_size = 1 * 2
-    if cluster_size not in _hw_info_cache:
-        hardware_info = cutlass.utils.HardwareInfo()
-        _hw_info_cache[cluster_size] = hardware_info.get_max_active_clusters(cluster_size)
-    max_active_clusters = _hw_info_cache[cluster_size]
-
-    # Compile (cached by valid_m) and execute GEMM1
-    gemm1_kernel = BlockwiseContiguousGroupedGemmKernel(
-        acc_dtype=cutlass.Float32,
-        use_2cta_instrs=False,
-        mma_tiler_mn=(128, 128),
-        cluster_shape_mn=(1, 2),
-    )
-    compiled_gemm1 = _get_compiled_gemm(
-        ("gemm1", valid_m), cute, gemm1_kernel,
-        a1_cute, b1_cute, c1_cute, sfa1_cute, sfb1_cute, gidx_cute,
-        max_active_clusters, current_stream,
-    )
-    compiled_gemm1(
-        a1_cute, b1_cute, c1_cute,
-        sfa1_cute, sfb1_cute,
-        gidx_cute,
-        current_stream,
-    )
-
-    # ---- Step 3: SwiGLU ----
-    gemm1_result = gemm1_out[:Tsum]                     # remove padding
-    gate = gemm1_result[:, :I].float()                  # [Tsum, I]
-    up = gemm1_result[:, I:].float()                    # [Tsum, I]
-    intermediate = F.silu(up) * gate                    # [Tsum, I]
-
-    # ---- Step 4: Prepare GEMM2 inputs (quantize intermediate to FP8) ----
-    a2, sfa2, b2, sfb2, gidx2 = prepare_gemm2_inputs(
-        intermediate, gemm2_weights, gemm2_weights_scale, gidx[:Tsum],
-    )
-
-    # Pad for alignment
-    a2_int8 = a2.view(torch.int8)
+    # ── Copy dynamic inputs into static buffers (async GPU copies) ────────────
+    reg['s_hidden'].copy_(hidden_states, non_blocking=True)
+    reg['s_hs_scale'].copy_(hidden_states_scale.float(), non_blocking=True)
+    reg['s_sorted_ids'][:Tsum].copy_(sorted_token_ids, non_blocking=True)
     if pad_m > 0:
-        a2_int8 = F.pad(a2_int8, (0, 0, 0, pad_m))
-        sfa2 = F.pad(sfa2, (0, 0, 0, pad_m))
-        gidx2_padded = F.pad(gidx2, (0, pad_m), value=0)
-    else:
-        gidx2_padded = gidx2
+        reg['s_sorted_ids'][Tsum:].fill_(0)
+    reg['s_token_map'][:Tsum].copy_(token_expert_map, non_blocking=True)
+    if pad_m > 0:
+        reg['s_token_map'][Tsum:].fill_(0)
+    reg['s_topk_idx'].copy_(topk_idx, non_blocking=True)
+    reg['s_weights'].copy_(weights, non_blocking=True)
 
-    # Allocate GEMM2 output: [valid_m, H]
-    gemm2_out = torch.zeros(valid_m, H, dtype=torch.bfloat16, device=device)
+    # ── Replay CUDA graph (zero Python overhead between GPU kernels) ───────────
+    reg['graph'].replay()
 
-    # ---- Step 5: GEMM2 via CuTe DSL ----
-    a2_cute = _make_cute_fp8_tensor(from_dlpack, a2_int8.unsqueeze(-1), cutlass)
-    sfa2_cute = _make_cute_tensor(from_dlpack, sfa2.unsqueeze(-1))
-    b2_cute = _make_cute_fp8_tensor(from_dlpack, b2.view(torch.int8).permute(1, 2, 0), cutlass)
-    sfb2_cute = _make_cute_tensor(from_dlpack, sfb2.permute(1, 2, 0))
-    c2_cute = _make_cute_tensor(from_dlpack, gemm2_out.unsqueeze(-1))
-    gidx2_cute = from_dlpack(gidx2_padded).mark_layout_dynamic()
-
-    gemm2_kernel = BlockwiseContiguousGroupedGemmKernel(
-        acc_dtype=cutlass.Float32,
-        use_2cta_instrs=False,
-        mma_tiler_mn=(128, 128),
-        cluster_shape_mn=(1, 2),
-    )
-    compiled_gemm2 = _get_compiled_gemm(
-        ("gemm2", valid_m), cute, gemm2_kernel,
-        a2_cute, b2_cute, c2_cute, sfa2_cute, sfb2_cute, gidx2_cute,
-        max_active_clusters, current_stream,
-    )
-    compiled_gemm2(
-        a2_cute, b2_cute, c2_cute,
-        sfa2_cute, sfb2_cute,
-        gidx2_cute,
-        current_stream,
-    )
-    torch.cuda.synchronize()
-
-    # ---- Step 6: Fused weighted scatter-add (single Triton kernel) ----
-    gemm2_result = gemm2_out[:Tsum].float()             # [Tsum, H]
-    return weighted_scatter_add(
-        gemm2_result, sorted_token_ids, token_expert_map,
-        topk_idx, weights, local_expert_offset, T,
-    )
+    return reg['output_buf'].float()
 
 
 # ==============================================================================
