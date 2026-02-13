@@ -4,5 +4,5 @@ definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
 author = "cutlass"
 
 [build]
-language = "python"              # python | triton | cuda
-entry_point = "kernel.py::kernel" # Kernel function: file::function
+language = "cuda"               # python | triton | cuda
+entry_point = "kernel.cu::kernel" # Kernel function: file::function
