@@ -47,8 +47,9 @@ def main():
     registry = get_builder_registry()
     runnable = registry.build(defn, solution)
 
-    # Use first workload (Trace has .workload attribute)
-    trace = workloads[0]
+    # Use workload index (change to debug different workloads)
+    wl_index = int(os.environ.get("WL_INDEX", "0"))
+    trace = workloads[wl_index]
     wl = trace.workload if hasattr(trace, "workload") else trace
     print(f"Testing workload: {wl.uuid[:8]}... (seq_len={wl.axes.get('seq_len')})")
 
