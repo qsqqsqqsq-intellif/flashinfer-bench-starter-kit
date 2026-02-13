@@ -2,7 +2,7 @@
 Pack solution source files into solution.json.
 
 Reads configuration from config.toml and packs the appropriate source files
-(Triton or CUDA) into a Solution JSON file for submission.
+(Python, Triton, or CUDA) into a Solution JSON file for submission.
 """
 
 import sys
@@ -17,8 +17,7 @@ try:
 except ImportError:
     import tomli as tomllib
 
-from flashinfer_bench import BuildSpec
-from flashinfer_bench.agents import pack_solution_from_files
+from flashinfer_bench import BuildSpec, Solution, SourceFile
 
 
 def load_config() -> dict:
@@ -29,6 +28,25 @@ def load_config() -> dict:
 
     with open(config_path, "rb") as f:
         return tomllib.load(f)
+
+
+def pack_solution_from_dir(source_dir: Path, spec: BuildSpec, name: str, definition: str, author: str) -> Solution:
+    """Pack source files from directory into a Solution."""
+    sources = []
+    for f in sorted(source_dir.iterdir()):
+        if f.is_file() and not f.name.startswith("."):
+            sources.append(
+                SourceFile(path=f.name, content=f.read_text())
+            )
+    if not sources:
+        raise ValueError(f"No source files found in {source_dir}")
+    return Solution(
+        name=name,
+        definition=definition,
+        author=author,
+        spec=spec,
+        sources=sources,
+    )
 
 
 def pack_solution(output_path: Path = None) -> Path:
@@ -46,13 +64,18 @@ def pack_solution(output_path: Path = None) -> Path:
         source_dir = PROJECT_ROOT / "solution" / "triton"
     elif language == "cuda":
         source_dir = PROJECT_ROOT / "solution" / "cuda"
+    elif language == "python":
+        source_dir = PROJECT_ROOT / "solution" / "python"
     else:
         raise ValueError(f"Unsupported language: {language}")
 
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
-    # Create build spec
+    # Create build spec (entry_point must be file::function for Python)
+    if language == "python" and "::" not in entry_point:
+        entry_point = f"{entry_point}.py::{entry_point}" if not entry_point.endswith(".py") else entry_point
+
     spec = BuildSpec(
         language=language,
         target_hardware=["cuda"],
@@ -60,8 +83,8 @@ def pack_solution(output_path: Path = None) -> Path:
     )
 
     # Pack the solution
-    solution = pack_solution_from_files(
-        path=str(source_dir),
+    solution = pack_solution_from_dir(
+        source_dir=source_dir,
         spec=spec,
         name=solution_config["name"],
         definition=solution_config["definition"],

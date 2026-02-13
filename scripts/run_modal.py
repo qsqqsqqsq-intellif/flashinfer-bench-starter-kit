@@ -27,7 +27,7 @@ TRACE_SET_PATH = "/data"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .pip_install("flashinfer-bench", "flashinfer-python", "torch", "triton", "numpy")
 )
 
 
