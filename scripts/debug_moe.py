@@ -2,8 +2,10 @@
 """
 Debug script for MoE kernel - runs kernel and checks correctness against reference.
 Run: FIB_DATASET_PATH=/home/qsq/mlsys2026/mlsys26-contest python scripts/debug_moe.py
+With NCU profiling: python scripts/debug_moe.py --ncu_profile
 """
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -25,6 +27,14 @@ from flashinfer_bench.utils import dtype_str_to_torch_dtype
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Debug MoE kernel")
+    parser.add_argument(
+        "--ncu_profile",
+        action="store_true",
+        help="NCU profiling mode: skip reference run and result check",
+    )
+    args = parser.parse_args()
+    ncu_profile = args.ncu_profile
     dataset_path = os.environ.get("FIB_DATASET_PATH", "/home/qsq/mlsys2026/mlsys26-contest")
     if not Path(dataset_path).exists():
         print(f"Error: Dataset not found at {dataset_path}")
@@ -49,7 +59,8 @@ def main():
 
     # Use workload index (change to debug different workloads)
     wl_index = int(os.environ.get("WL_INDEX", "0"))
-    trace = workloads[wl_index]
+    # trace = workloads[wl_index]
+    trace = workloads[8]
     wl = trace.workload if hasattr(trace, "workload") else trace
     print(f"Testing workload: {wl.uuid[:8]}... (seq_len={wl.axes.get('seq_len')})")
 
@@ -65,18 +76,19 @@ def main():
         else:
             print(f"  {k}: {v} (scalar)")
 
-    # Build reference and run both
-    print("\nRunning reference implementation...")
-    ref_runnable = registry.build_reference(defn)
     output_names = list(defn.outputs.keys())
     output_dtypes = {k: dtype_str_to_torch_dtype(v.dtype) for k, v in defn.outputs.items()}
 
-    with torch.no_grad():
-        ref_out = ref_runnable(**inputs)
-    torch.cuda.synchronize(device)
-    ref_out = normalize_outputs(
-        ref_out, device=torch.device(device), output_names=output_names, output_dtypes=output_dtypes
-    )
+    if not ncu_profile:
+        # Build reference and run
+        print("\nRunning reference implementation...")
+        ref_runnable = registry.build_reference(defn)
+        with torch.no_grad():
+            ref_out = ref_runnable(**inputs)
+        torch.cuda.synchronize(device)
+        ref_out = normalize_outputs(
+            ref_out, device=torch.device(device), output_names=output_names, output_dtypes=output_dtypes
+        )
 
     print("Running solution kernel...")
     try:
@@ -92,6 +104,10 @@ def main():
     out = normalize_outputs(
         out, device=torch.device(device), output_names=output_names, output_dtypes=output_dtypes
     )
+
+    if ncu_profile:
+        print("\n*** NCU profile mode: skipped reference run and result check ***")
+        sys.exit(0)
 
     # Result check: compare against reference
     cfg = BenchmarkConfig(rtol=1e-2, atol=1e-2, required_matched_ratio=0.95)
@@ -132,7 +148,6 @@ def main():
     out_mean, out_std = out_f.mean().item(), out_f.std().item()
     print(f"  Ref  mean={ref_mean:.4f} std={ref_std:.4f}")
     print(f"  Out  mean={out_mean:.4f} std={out_std:.4f}")
-
 
     if exceeds_tol:
         print(f"\n*** FAIL: Correctness check failed (matched ratio {matched_ratio:.2%} < {cfg.required_matched_ratio or 1.0:.0%})")
