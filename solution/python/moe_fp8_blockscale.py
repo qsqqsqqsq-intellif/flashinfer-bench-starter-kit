@@ -183,11 +183,14 @@ def deepseek_routing(
 
 
 # ==============================================================================
-# Part 2: Token Permutation (Fused Single Triton Kernel)
+# Part 2: Token Permutation
 #
-# Replaces 2 Triton kernels + cumsum + pad + 2 memsets (~6 kernel launches)
-# with a single kernel. One program does count → cumsum → scatter in 3 phases.
+# Two implementations:
+#   - Single-program kernel for small N (low launch overhead)
+#   - Parallel 3-kernel approach for large N (>4K elements)
 # ==============================================================================
+
+# --- Single-program kernel (kept for small N) ---
 @triton.jit
 def _permute_kernel(
     topk_idx_ptr,           # [N] int64 input (flattened topk_idx)
@@ -252,6 +255,83 @@ def _permute_kernel(
         tl.store(token_expert_map_ptr + write_idx, le_safe.to(tl.int32), mask=valid)
 
 
+# --- Parallel kernels for large N ---
+@triton.jit
+def _permute_count_kernel(
+    topk_idx_ptr,           # [N] int64 input
+    counts_ptr,             # [E_LOCAL] int32 output (atomically incremented)
+    local_expert_offset,
+    num_local_experts,
+    N,                      # runtime value (not constexpr — varies per call)
+    E_LOCAL: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Phase 1: Each program counts tokens in its chunk via atomics."""
+    pid = tl.program_id(0)
+    start = pid * BLOCK_SIZE
+    offsets = start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    ge = tl.load(topk_idx_ptr + offsets, mask=mask, other=-1)
+    le = ge - local_expert_offset
+    valid = (le >= 0) & (le < num_local_experts) & mask
+    le_safe = tl.where(valid, le, 0)
+    tl.atomic_add(counts_ptr + le_safe, 1, mask=valid)
+
+
+@triton.jit
+def _permute_cumsum_kernel(
+    counts_ptr,             # [E_LOCAL] int32 input
+    expert_offsets_ptr,     # [E_LOCAL + 1] int32 output
+    E_LOCAL: tl.constexpr,
+):
+    """Phase 2: Single-program exclusive prefix sum on 32 expert counts."""
+    expert_range = tl.arange(0, E_LOCAL)
+    counts = tl.load(counts_ptr + expert_range)
+    offsets_vec = tl.zeros([E_LOCAL], dtype=tl.int32)
+    running_sum = 0
+    for e in range(E_LOCAL):
+        mask_e = (expert_range == e)
+        offsets_vec = tl.where(mask_e, running_sum, offsets_vec)
+        running_sum = running_sum + tl.sum(tl.where(mask_e, counts, 0))
+    tl.store(expert_offsets_ptr + expert_range, offsets_vec)
+    tl.store(expert_offsets_ptr + E_LOCAL, running_sum)
+
+
+@triton.jit
+def _permute_scatter_kernel(
+    topk_idx_ptr,           # [N] int64 input
+    sorted_token_ids_ptr,   # [N] int64 output
+    expert_offsets_ptr,     # [E_LOCAL + 1] int32 input (from cumsum)
+    token_expert_map_ptr,   # [N] int32 output
+    write_counter_ptr,      # [E_LOCAL] int32 scratch (atomically incremented)
+    local_expert_offset,
+    num_local_experts,
+    N,                      # runtime value
+    top_k: tl.constexpr,
+    E_LOCAL: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Phase 3: Each program scatters tokens from its chunk via atomics."""
+    pid = tl.program_id(0)
+    start = pid * BLOCK_SIZE
+    offsets = start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    ge = tl.load(topk_idx_ptr + offsets, mask=mask, other=-1)
+    le = ge - local_expert_offset
+    valid = (le >= 0) & (le < num_local_experts) & mask
+    le_safe = tl.where(valid, le, 0)
+    token_id = (offsets // top_k).to(tl.int64)
+    pos = tl.atomic_add(write_counter_ptr + le_safe, 1, mask=valid)
+    base = tl.load(expert_offsets_ptr + le_safe, mask=valid, other=0)
+    write_idx = base + pos
+    tl.store(sorted_token_ids_ptr + write_idx, token_id, mask=valid)
+    tl.store(token_expert_map_ptr + write_idx, le_safe.to(tl.int32), mask=valid)
+
+
+# Threshold: use parallel kernels when N > this value
+_PERMUTE_PARALLEL_THRESHOLD = 4096
+
+
 def permute_tokens(
     topk_idx: torch.Tensor,        # [T, TOP_K]
     local_expert_offset: int,
@@ -276,16 +356,47 @@ def permute_tokens(
     sorted_token_ids = torch.empty(N, dtype=torch.long, device=device)
     token_expert_map = torch.empty(N, dtype=torch.int32, device=device)
     expert_offsets = torch.empty(num_local_experts + 1, dtype=torch.int32, device=device)
-    counts = torch.empty(num_local_experts, dtype=torch.int32, device=device)
-    write_counter = torch.empty(num_local_experts, dtype=torch.int32, device=device)
 
-    _permute_kernel[(1,)](
-        flat_idx, sorted_token_ids, expert_offsets, token_expert_map,
-        counts, write_counter,
-        local_expert_offset, num_local_experts,
-        top_k=TOP_K, N=N, E_LOCAL=num_local_experts,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    if N <= _PERMUTE_PARALLEL_THRESHOLD:
+        # Small N: single-program kernel (lower launch overhead)
+        counts = torch.empty(num_local_experts, dtype=torch.int32, device=device)
+        write_counter = torch.empty(num_local_experts, dtype=torch.int32, device=device)
+
+        _permute_kernel[(1,)](
+            flat_idx, sorted_token_ids, expert_offsets, token_expert_map,
+            counts, write_counter,
+            local_expert_offset, num_local_experts,
+            top_k=TOP_K, N=N, E_LOCAL=num_local_experts,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+    else:
+        # Large N: parallel 3-kernel approach
+        num_blocks = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+        # torch.zeros launches a fast memset kernel
+        counts = torch.zeros(num_local_experts, dtype=torch.int32, device=device)
+        write_counter = torch.zeros(num_local_experts, dtype=torch.int32, device=device)
+
+        # Phase 1: Parallel count — each of num_blocks programs processes BLOCK_SIZE elements
+        _permute_count_kernel[(num_blocks,)](
+            flat_idx, counts,
+            local_expert_offset, num_local_experts,
+            N, E_LOCAL=num_local_experts, BLOCK_SIZE=BLOCK_SIZE,
+        )
+
+        # Phase 2: Cumsum — single program, 32 elements (trivial)
+        _permute_cumsum_kernel[(1,)](
+            counts, expert_offsets,
+            E_LOCAL=num_local_experts,
+        )
+
+        # Phase 3: Parallel scatter — each program scatters its chunk
+        _permute_scatter_kernel[(num_blocks,)](
+            flat_idx, sorted_token_ids, expert_offsets, token_expert_map,
+            write_counter,
+            local_expert_offset, num_local_experts,
+            N, top_k=TOP_K, E_LOCAL=num_local_experts, BLOCK_SIZE=BLOCK_SIZE,
+        )
 
     Tsum = expert_offsets[num_local_experts].item()
 
@@ -758,7 +869,7 @@ def _build_cuda_graph(
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
     import cuda.bindings.driver as cuda
-    from .contiguous_grouped_gemm import BlockwiseContiguousGroupedGemmKernel
+    from contiguous_grouped_gemm import BlockwiseContiguousGroupedGemmKernel
 
     H_BLOCKS = H // BLOCK
     I_BLOCKS = I // BLOCK
@@ -814,7 +925,7 @@ def _build_cuda_graph(
                             assumed_align=16).mark_layout_dynamic(leading_dim=1)
 
     # ── Compile CuTe GEMM kernels (cached by valid_m) ─────────────────────────
-    cluster_size = 1 * 2
+    cluster_size = 2 * 2
     if cluster_size not in _hw_info_cache:
         _hw_info_cache[cluster_size] = (
             cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size)
@@ -827,8 +938,8 @@ def _build_cuda_graph(
     compiled_gemm1 = _get_compiled_gemm(
         ("gemm1", valid_m), cute,
         BlockwiseContiguousGroupedGemmKernel(
-            acc_dtype=cutlass.Float32, use_2cta_instrs=False,
-            mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 2),
+            acc_dtype=cutlass.Float32, use_2cta_instrs=True,
+            mma_tiler_mn=(128, 128), cluster_shape_mn=(2, 2),
         ),
         a1_cute, b1_cute, c1_cute, sfa1_cute, sfb1_cute, gidx_cute,
         max_active_clusters, cu_stream,
@@ -836,8 +947,8 @@ def _build_cuda_graph(
     compiled_gemm2 = _get_compiled_gemm(
         ("gemm2", valid_m), cute,
         BlockwiseContiguousGroupedGemmKernel(
-            acc_dtype=cutlass.Float32, use_2cta_instrs=False,
-            mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 2),
+            acc_dtype=cutlass.Float32, use_2cta_instrs=True,
+            mma_tiler_mn=(128, 128), cluster_shape_mn=(2, 2),
         ),
         a2_cute, b2_cute, c2_cute, sfa2_cute, sfb2_cute, gidx_cute,
         max_active_clusters, cu_stream,

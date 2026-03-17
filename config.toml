@@ -6,3 +6,4 @@ author = "cutlass"
 [build]
 language = "python"               # python | triton | cuda
 entry_point = "kernel.py::kernel" # Kernel function: file::function
+destination_passing_style = false # true = output tensor passed as last arg; false = kernel returns output

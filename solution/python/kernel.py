@@ -13,7 +13,9 @@ Computation flow:
 
 import torch
 
-from .moe_fp8_blockscale import run as _run
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from moe_fp8_blockscale import run as _run
 
 
 @torch.no_grad()

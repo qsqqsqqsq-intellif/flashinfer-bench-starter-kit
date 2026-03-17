@@ -58,6 +58,7 @@ def pack_solution(output_path: Path = None) -> Path:
 
     language = build_config["language"]
     entry_point = build_config["entry_point"]
+    dps = build_config.get("destination_passing_style", True)
 
     # Determine source directory based on language
     if language == "triton":
@@ -80,6 +81,7 @@ def pack_solution(output_path: Path = None) -> Path:
         language=language,
         target_hardware=["cuda"],
         entry_point=entry_point,
+        destination_passing_style=dps,
     )
 
     # Pack the solution
